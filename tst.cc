@@ -76,17 +76,19 @@ public:
         data.push_back(val);
     }
 
+    template <typename T>
+    void write_value(T val) {
+        uint8_t *val_ptr = (uint8_t*)&val;
+        data.insert(data.end(), val_ptr, val_ptr + sizeof(T));
+    }
+
     void write_vector(const std::vector<uint8_t> &val) {
-        uint64_t size = val.size();
-        uint8_t *size_ptr = (uint8_t*)&size;
-        data.insert(data.end(), size_ptr, size_ptr + 8);
+        write_value<uint64_t>(val.size());
         data.insert(data.end(), val.begin(), val.end());
     }
 
     void write_string(const std::string &val) {
-        uint64_t size = val.size();
-        uint8_t *size_ptr = (uint8_t*)&size;
-        data.insert(data.end(), size_ptr, size_ptr + 8);
+        write_value<uint64_t>(val.size());
         data.insert(data.end(), val.data(), val.data() + val.size());
     }
 
@@ -338,7 +340,6 @@ public:
         //1 byte command SET (done by the outer loop)
         //key: 1 string
 
-
         std::string key;
         if(!stream.read_str(key))
             return false;
@@ -355,17 +356,44 @@ public:
     bool parse_add_command() {
         //1 byte command SET (done by the outer loop)
         //key: 1 string
-
+        //addVal: int64
 
         std::string key;
         if(!stream.read_str(key))
             return false;
+
+        int64_t addVal = 0;
+        if(!stream.read_value(addVal))
+            return false;
+
         stream.commit();
 
-        auto data = tcpStore_.at(key);
+        bool newKey = true;
+        std::vector<uint8_t> oldData;
+        auto it = tcpStore_.find(key);
+        if (it != tcpStore_.end()) {
+            oldData = it->second;
+            auto buf = reinterpret_cast<const char*>(it->second.data());
+            auto len = it->second.size();
+            addVal += std::stoll(std::string(buf, len));
+            newKey = false;
+        }
+        auto addValStr = std::to_string(addVal);
+        std::vector<uint8_t> newData = std::vector<uint8_t>(addValStr.begin(), addValStr.end());
+        tcpStore_[key] = newData;
+        // Now send the new value
+
         StreamWriter* sw = new StreamWriter();
-        sw->write_vector(data);
+        sw->write_value(addVal);
         sw->send(as_stream());
+
+        // On "add", wake up all clients that have been waiting
+        wakeupWaitingClients(key);
+        // Send key update to all watching clients
+        newKey ? sendKeyUpdatesToClients(
+                key, WatchResponseType::KEY_CREATED, oldData, newData)
+            : sendKeyUpdatesToClients(
+                key, WatchResponseType::KEY_UPDATED, oldData, newData);
 
         return true;
     }

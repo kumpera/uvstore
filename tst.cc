@@ -39,6 +39,7 @@ TODO:
     Move to use refcount UvClient
     Add MSG_NOSIGNAL support (is it possible?)
     cache alloc_buffer or, at least, make it return smaller sizes
+    wrap a simplified wrapper around StreamWriter
 */
 
 class UvClient;
@@ -238,6 +239,10 @@ public:
                 if(!parse_set_command())
                     return;
                 break;
+            case QueryType::COMPARE_SET:
+                if(!parse_compare_set_command())
+                    return;
+                break;
             case QueryType::GET:
                 if(!parse_get_command())
                     return;
@@ -398,7 +403,64 @@ public:
         return true;
     }
 
+    bool parse_compare_set_command() {
+        //key: string
+        //current: vector
+        //new: vector
+        std::string key;
+        if(!stream.read_str(key))
+            return false;
 
+        std::vector<uint8_t> currentValue;
+        if(!stream.read_vector(currentValue))
+            return false;
+
+        std::vector<uint8_t> newValue;
+        if(!stream.read_vector(newValue))
+            return false;
+        stream.commit();
+
+        printf("adding key %s cu: %s new: %s\n", key.c_str(), currentValue.data(), newValue.data());
+
+        auto pos = tcpStore_.find(key);
+        if (pos == tcpStore_.end()) {
+            if (currentValue.empty()) {
+                printf("\tnew key created\n");
+                tcpStore_[key] = newValue;
+
+                // Send key update to all watching clients
+                sendKeyUpdatesToClients(
+                    key, WatchResponseType::KEY_CREATED, currentValue, newValue);
+
+                StreamWriter* sw = new StreamWriter();
+                sw->write_vector(newValue);
+                sw->send(as_stream());
+            } else {
+                printf("\tstupid state\n");
+                // TODO: This code path is not ideal as we are "lying" to the caller in
+                // case the key does not exist. We should come up with a working solution.
+                StreamWriter* sw = new StreamWriter();
+                sw->write_vector(currentValue);
+                sw->send(as_stream());
+            }
+        } else {
+            if (pos->second == currentValue) {
+                pos->second = std::move(newValue);
+                printf("\tbingo replacing\n");
+
+                // Send key update to all watching clients
+                sendKeyUpdatesToClients(
+                    key, WatchResponseType::KEY_UPDATED, currentValue, pos->second);
+            } else {
+                printf("\tunlucky, val doesnt'match\n");
+            }
+
+            StreamWriter* sw = new StreamWriter();
+            sw->write_vector(pos->second);
+            sw->send(as_stream());
+        }
+        return true;
+    }
 };
 
 

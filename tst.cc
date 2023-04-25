@@ -33,7 +33,56 @@ enum class WatchResponseType : uint8_t {
   KEY_CALLBACK_REGISTERED
 };
 
-class UvStream {
+/*
+TODO:
+    Wrap uv_client_t in a class so we can bind ChunkedStream to it.
+    Move the commit logic to the main loop instead of on each command, it sucks
+*/
+
+void write_done(uv_write_t *req, int status) ;
+
+
+class StreamWriter {
+    std::vector<uint8_t> data;
+    uv_write_t req;
+    uv_buf_t buf;
+
+public:
+    StreamWriter() {} 
+
+    void write1(uint8_t val) {
+        data.push_back(val);
+    }
+
+    void write_vector(const std::vector<uint8_t> &val) {
+        uint64_t size = val.size();
+        uint8_t *size_ptr = (uint8_t*)&size;
+        data.insert(data.end(), size_ptr, size_ptr + 8);
+        data.insert(data.end(), val.begin(), val.end());
+    }
+
+    void send(uv_stream_t *client){
+        buf = uv_buf_init((char*)data.data(), data.size());
+        uv_write(&req, client, &buf, 1, write_done);
+    }
+    static StreamWriter* from_write_request(uv_write_t *req) {
+        size_t offset = offsetof(StreamWriter, req);
+        return reinterpret_cast<StreamWriter*>(reinterpret_cast<char*>(req) - offset);
+
+    }
+};
+
+
+void write_done(uv_write_t *req, int status) {
+    printf("write done for %p\n", req);
+    if (status) {
+        printf("Write error %s\n", uv_strerror(status));
+    }
+
+    StreamWriter *sw = StreamWriter::from_write_request(req);
+    delete sw;
+}
+class ChunkedStream {
     std::deque<uv_buf_t> buffers;
     int buff_idx;
     int buff_offset;
@@ -41,7 +90,7 @@ class UvStream {
     int buff_offset_commit;
 
 public:
-    UvStream(): buff_idx(0), buff_offset(0), buff_offset_commit(0) {
+    ChunkedStream(): buff_idx(0), buff_offset(0), buff_offset_commit(0) {
 
     }
 
@@ -140,7 +189,7 @@ public:
 
 static uv_loop_t *loop;
 // TODO make this client-associated
-class UvStream the_stream;
+class ChunkedStream the_stream;
 std::unordered_map<std::string, std::vector<uint8_t>> tcpStore_;
 
 void on_close(uv_handle_t* handle) {
@@ -154,8 +203,8 @@ void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
     buf->len = suggested_size;
 }
 
-bool checkKeys(const std::vector<std::string>& keys) const {
-  return std::all_of(keys.begin(), keys.end(), [this](const std::string& s) {
+bool checkKeys(const std::vector<std::string>& keys) {
+  return std::all_of(keys.begin(), keys.end(), [](const std::string& s) {
     return tcpStore_.count(s) > 0;
   });
 }
@@ -213,8 +262,9 @@ bool parse_wait_command(uv_stream_t *client) {
     }
 
   if (checkKeys(keys)) {
-    tcputil::sendValue<WaitResponseType>(
-        socket, WaitResponseType::STOP_WAITING);
+    StreamWriter* sw = new StreamWriter();
+    sw->write1((uint8_t)WaitResponseType::STOP_WAITING);
+    sw->send(client);
   } else {
     printf("TODO implement wait\n");
   }
@@ -228,6 +278,23 @@ bool parse_wait_command(uv_stream_t *client) {
 //     }
 //     keysAwaited_[socket] = numKeysToAwait;
 //   }
+
+    return true;
+}
+
+bool parse_get_command(uv_stream_t *client) {
+    //1 byte command SET (done by the outer loop)
+    //key: 1 string
+
+    std::string key;
+    if(!the_stream.read_str(key))
+        return false;
+    the_stream.commit();
+
+    auto data = tcpStore_.at(key);
+    StreamWriter* sw = new StreamWriter();
+    sw->write_vector(data);
+    sw->send(client);
 
     return true;
 }
@@ -250,12 +317,16 @@ void read_callback(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
         uint8_t command = -1;
         if(!the_stream.read1(command))
             break;
-        switch (command) {
-        case SET:
+        switch ((QueryType)command) {
+        case QueryType::SET:
             if(!parse_set_command())
                 return;
             break;
-        case WAIT:
+        case QueryType::GET:
+            if(!parse_get_command(client))
+                return;
+            break;
+        case QueryType::WAIT:
             if(!parse_wait_command(client))
                 return;
             break;

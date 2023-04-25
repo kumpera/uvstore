@@ -40,6 +40,7 @@ TODO:
     Add MSG_NOSIGNAL support (is it possible?)
     cache alloc_buffer or, at least, make it return smaller sizes
     wrap a simplified wrapper around StreamWriter
+    expose watchKey to python (I got a commit to expose check)
 */
 
 class UvClient;
@@ -263,9 +264,14 @@ public:
                 if(!parse_getnumkeys_command())
                     return;
                 break;
-//   GETNUMKEYS,
-//   WATCH_KEY,
-//   DELETE_KEY,
+            case QueryType::WATCH_KEY:
+                if(!parse_watch_key_command())
+                    return;
+                break;
+            case QueryType::DELETE_KEY:
+                if(!parse_delete_key_command())
+                    return;
+                break;
 
             default:
                 printf("invalid command %d\n", command);
@@ -514,30 +520,47 @@ public:
         return true;
     }
 
-// void TCPStoreMasterDaemon::deleteHandler(int socket) {
-//   std::string key = tcputil::recvString(socket);
-//   auto it = tcpStore_.find(key);
-//   if (it != tcpStore_.end()) {
-//     std::vector<uint8_t> oldData = it->second;
-//     // Send key update to all watching clients
-//     std::vector<uint8_t> newData;
-//     sendKeyUpdatesToClients(
-//         key, WatchResponseType::KEY_DELETED, oldData, newData);
-//   }
-//   auto numDeleted = tcpStore_.erase(key);
-//   tcputil::sendValue<int64_t>(socket, numDeleted);
-// }
+    bool parse_delete_key_command() {
+        //key: string
+        std::string key;
+        if(!stream.read_str(key))
+            return false;
+        stream.commit();
 
-// void TCPStoreMasterDaemon::watchHandler(int socket) {
-//   std::string key = tcputil::recvString(socket);
+        auto it = tcpStore_.find(key);
+        if (it != tcpStore_.end()) {
+        std::vector<uint8_t> oldData = it->second;
+        // Send key update to all watching clients
+        std::vector<uint8_t> newData;
+        sendKeyUpdatesToClients(
+        key, WatchResponseType::KEY_DELETED, oldData, newData);
+        }
+        auto numDeleted = tcpStore_.erase(key);
 
-//   // Record the socket to respond to when the key is updated
-//   watchedSockets_[key].push_back(socket);
+        StreamWriter* sw = new StreamWriter();
+        sw->write_value<int64_t>(numDeleted);
+        sw->send(as_stream());
 
-//   // Send update to TCPStoreWorkerDaemon on client
-//   tcputil::sendValue<WatchResponseType>(
-//       socket, WatchResponseType::KEY_CALLBACK_REGISTERED);
-// }
+        return true;
+    }
+
+    bool parse_watch_key_command() {
+        //key: string
+        std::string key;
+        if(!stream.read_str(key))
+            return false;
+        stream.commit();
+
+        // Record the socket to respond to when the key is updated
+        watchedSockets_[key].push_back(this);
+
+        // Send update to TCPStoreWorkerDaemon on client
+
+        StreamWriter* sw = new StreamWriter();
+        sw->write_value(WatchResponseType::KEY_CALLBACK_REGISTERED);
+        sw->send(as_stream());
+        return true;
+    }
 };
 
 
@@ -597,14 +620,7 @@ void sendKeyUpdatesToClients(
         sw->write_string(key);
         sw->write_vector(oldData);
         sw->write_vector(newData);
-
-
         sw->send(client->as_stream());
-
-    // tcputil::sendValue<WatchResponseType>(socket, type);
-    // tcputil::sendString(socket, key, true);
-    // tcputil::sendVector<uint8_t>(socket, oldData);
-    // tcputil::sendVector<uint8_t>(socket, newData);
   }
 }
 

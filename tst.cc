@@ -41,6 +41,9 @@ TODO:
     cache alloc_buffer or, at least, make it return smaller sizes
     wrap a simplified wrapper around StreamWriter
     expose watchKey to python (I got a commit to expose check)
+    proper error handling
+    logging
+    telemetry
 */
 
 class UvClient;
@@ -184,15 +187,12 @@ public:
     }
 
     void commit () {
-        // printf("commiting %d [%d] bs:%zu bisz:%zu\n", buff_idx, buff_offset, buffers.size(), buffers[buff_idx].len);
         if(buff_idx >= buffers.size() || buff_offset >= buffers[buff_idx].len) {
-            // printf("\treset offset, full use\n");
             buff_offset = 0;
             ++buff_idx;
         }
 
         for(int i = 0; i < buff_idx; ++i) {
-            // printf("deleting [%d] %p\n", i, buffers[0].base);
             free(buffers[0].base);
             buffers.pop_front();
         }
@@ -203,7 +203,6 @@ public:
     void reset() {
         buff_idx = 0;
         buff_offset = buff_offset_commit;
-        // printf("reset to offset %d\n", buff_offset);
     }
 };
 
@@ -282,9 +281,8 @@ public:
     }
 
     bool parse_set_command() {
-        //1 byte command SET (done by the outer loop)
-        //key: 1 string
-        //data: 1 vector
+        //key: string
+        //data: vector
 
         std::string key;
         if(!stream.read_str(key))
@@ -318,9 +316,9 @@ public:
     }
 
     bool parse_wait_command() {
-        //1 byte command SET (done by the outer loop)
-        //key_count : int64_t
-        //key_count x strings
+        //key_count: int64_t
+        //keys: string[key_count]
+
         uint64_t key_count = 0;
         if(!stream.read_value(key_count))
             return false;
@@ -343,7 +341,6 @@ public:
             sw->write1((uint8_t)WaitResponseType::STOP_WAITING);
             sw->send(as_stream());
         } else {
-            printf("TODO implement wait\n");
             int numKeysToAwait = 0;
             for (auto& key : keys) {
                 // Only count keys that have not already been set
@@ -359,8 +356,7 @@ public:
     }
 
     bool parse_get_command() {
-        //1 byte command SET (done by the outer loop)
-        //key: 1 string
+        //key: string
 
         std::string key;
         if(!stream.read_str(key))
@@ -376,8 +372,7 @@ public:
     }
 
     bool parse_add_command() {
-        //1 byte command SET (done by the outer loop)
-        //key: 1 string
+        //key: string
         //addVal: int64
 
         std::string key;
@@ -482,6 +477,7 @@ public:
     bool parse_check_command() {
         //key_count : int64_t
         //keys: string[key_count]
+
         uint64_t key_count = 0;
         if(!stream.read_value(key_count))
             return false;
@@ -522,6 +518,7 @@ public:
 
     bool parse_delete_key_command() {
         //key: string
+
         std::string key;
         if(!stream.read_str(key))
             return false;
@@ -546,6 +543,7 @@ public:
 
     bool parse_watch_key_command() {
         //key: string
+
         std::string key;
         if(!stream.read_str(key))
             return false;
@@ -565,7 +563,6 @@ public:
 
 
 void write_done(uv_write_t *req, int status) {
-    printf("write done for %p\n", req);
     if (status) {
         printf("Write error %s\n", uv_strerror(status));
     }
@@ -581,7 +578,6 @@ void on_close(uv_handle_t* handle) {
 
 
 void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
-    // printf("allocating %p for %zu\n", handle, suggested_size);
     buf->base = (char*) malloc(suggested_size);
     buf->len = suggested_size;
 }
@@ -626,12 +622,9 @@ void sendKeyUpdatesToClients(
 
 
 void read_callback(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
-    // printf("read cb %zu\n", nread);
     if (nread < 0) {
         if (nread != UV_EOF)
             printf("Read error %s\n", uv_err_name(nread));
-        // else
-        //     printf("disconnect?\n");
         uv_close((uv_handle_t*) client, on_close);
         return;
     }
@@ -641,7 +634,6 @@ void read_callback(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
 
 
 void on_new_connection(uv_stream_t *server, int status){
-    // printf("on_new_connection status %d\n", status);
     if (status < 0){ 
         printf("Accept error: %s\n", uv_strerror(status));
         return;
@@ -649,19 +641,16 @@ void on_new_connection(uv_stream_t *server, int status){
 
     UvClient *client = new UvClient(loop);
     if (uv_accept(server, client->as_stream()) == 0) {
-        // printf("accept all good, starting to read\n");
         uv_read_start((uv_stream_t*) client->as_stream(), alloc_buffer, read_callback);
     } else {
         printf("failed to accept socket\n");
         uv_close((uv_handle_t*) client->as_stream(), on_close);
-
     }
 }
 
 
 int main() {
     struct sockaddr_in addr;
-    printf("oi\n");
     loop = (uv_loop_t*)malloc(sizeof(uv_loop_t));
     uv_loop_init(loop);
 

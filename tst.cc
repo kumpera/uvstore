@@ -4,13 +4,13 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <unordered_map>
+#include <algorithm>
 
 #define PORT 1234
 #define DEFAULT_BACKLOG 128
 
-
-
-enum QueryType {
+enum class QueryType : uint8_t {
   SET,
   COMPARE_SET,
   GET,
@@ -20,6 +20,17 @@ enum QueryType {
   GETNUMKEYS,
   WATCH_KEY,
   DELETE_KEY,
+};
+
+enum class CheckResponseType : uint8_t { READY, NOT_READY };
+
+enum class WaitResponseType : uint8_t { STOP_WAITING };
+
+enum class WatchResponseType : uint8_t {
+  KEY_UPDATED,
+  KEY_CREATED,
+  KEY_DELETED,
+  KEY_CALLBACK_REGISTERED
 };
 
 class UvStream {
@@ -130,6 +141,7 @@ public:
 static uv_loop_t *loop;
 // TODO make this client-associated
 class UvStream the_stream;
+std::unordered_map<std::string, std::vector<uint8_t>> tcpStore_;
 
 void on_close(uv_handle_t* handle) {
     free(handle);
@@ -142,11 +154,21 @@ void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
     buf->len = suggested_size;
 }
 
+bool checkKeys(const std::vector<std::string>& keys) const {
+  return std::all_of(keys.begin(), keys.end(), [this](const std::string& s) {
+    return tcpStore_.count(s) > 0;
+  });
+}
+
+
 
 bool parse_set_command() {
     //1 byte command SET (done by the outer loop)
-    std::string str;
-    if(!the_stream.read_str(str))
+    //key: 1 string
+    //data: 1 vector
+
+    std::string key;
+    if(!the_stream.read_str(key))
         return false;
 
     std::vector<uint8_t> data;
@@ -154,13 +176,60 @@ bool parse_set_command() {
         return false;
 
     the_stream.commit();
-    printf("adding key %s with %zu bytes\n", str.c_str(), data.size());
-    //key: 1 string
-    //data: 1 vector
+    printf("adding key %s with %zu bytes\n", key.c_str(), data.size());
+    tcpStore_[key] = data;
 
+    // On "set", wake up all clients that have been waiting
+    //   wakeupWaitingClients(key);
+    //   // Send key update to all watching clients
+    //   newKey ? sendKeyUpdatesToClients(
+    //                key, WatchResponseType::KEY_CREATED, oldData, newData)
+    //          : sendKeyUpdatesToClients(
+    //                key, WatchResponseType::KEY_UPDATED, oldData, newData);
 
     return true;
-    
+}
+
+
+bool parse_wait_command(uv_stream_t *client) {
+    //1 byte command SET (done by the outer loop)
+    //key_count : int64_t
+    //key_count x strings
+    uint64_t key_count = 0;
+    if(!the_stream.read_value(key_count))
+        return false;
+
+    std::vector<std::string> keys(key_count);
+    for(auto i = 0; i < key_count; ++i) {
+        if(!the_stream.read_str(keys[i]))
+            return false;
+    }
+
+    the_stream.commit();
+
+    printf("WAIT %zu keys\n", key_count);
+    for(auto i = 0; i < key_count; ++i) {
+        printf("\t[%d] %s\n", i, keys[i].c_str());
+    }
+
+  if (checkKeys(keys)) {
+    tcputil::sendValue<WaitResponseType>(
+        socket, WaitResponseType::STOP_WAITING);
+  } else {
+    printf("TODO implement wait\n");
+  }
+//     int numKeysToAwait = 0;
+//     for (auto& key : keys) {
+//       // Only count keys that have not already been set
+//       if (tcpStore_.find(key) == tcpStore_.end()) {
+//         waitingSockets_[key].push_back(socket);
+//         numKeysToAwait++;
+//       }
+//     }
+//     keysAwaited_[socket] = numKeysToAwait;
+//   }
+
+    return true;
 }
 
 void read_callback(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
@@ -183,9 +252,14 @@ void read_callback(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
             break;
         switch (command) {
         case SET:
-            if(parse_set_command())
+            if(!parse_set_command())
                 return;
             break;
+        case WAIT:
+            if(!parse_wait_command(client))
+                return;
+            break;
+                
         default:
             printf("invalid command %d\n", command);
             uv_close((uv_handle_t*) client, on_close);

@@ -251,6 +251,10 @@ public:
                 if(!parse_add_command())
                     return;
                 break;
+            case QueryType::CHECK:
+                if(!parse_check_command())
+                    return;
+                break;
             case QueryType::WAIT:
                 if(!parse_wait_command())
                     return;
@@ -461,6 +465,39 @@ public:
         }
         return true;
     }
+
+    bool parse_check_command() {
+        //key_count : int64_t
+        //keys: string[key_count]
+        uint64_t key_count = 0;
+        if(!stream.read_value(key_count))
+            return false;
+
+        std::vector<std::string> keys(key_count);
+        for(auto i = 0; i < key_count; ++i) {
+            if(!stream.read_str(keys[i]))
+                return false;
+        }
+        stream.commit();
+        printf("CHECK %zu keys\n", key_count);
+        for(auto i = 0; i < key_count; ++i) {
+            printf("\t[%d] %s\n", i, keys[i].c_str());
+        }
+
+        // Now we have received all the keys
+        StreamWriter* sw = new StreamWriter();
+        if (checkKeys(keys)) {
+            printf("-> READY\n");
+            sw->write_value(CheckResponseType::READY);
+        } else {
+            printf("-> NOT READY\n");
+            sw->write_value(CheckResponseType::NOT_READY);
+        }
+        sw->send(as_stream());
+        return true;
+    }
+
+
 };
 
 

@@ -35,11 +35,33 @@ enum class WatchResponseType : uint8_t {
 
 /*
 TODO:
-    Wrap uv_client_t in a class so we can bind ChunkedStream to it.
     Move the commit logic to the main loop instead of on each command, it sucks
+    Move to use refcount UvClient
+    Add MSG_NOSIGNAL support (is it possible?)
+    cache alloc_buffer or, at least, make it return smaller sizes
 */
 
+class UvClient;
+
 void write_done(uv_write_t *req, int status) ;
+void on_close(uv_handle_t* handle);
+bool checkKeys(const std::vector<std::string>& keys);
+void wakeupWaitingClients(const std::string& key);
+void sendKeyUpdatesToClients(
+    const std::string& key,
+    WatchResponseType type,
+    std::vector<uint8_t>& oldData,
+    std::vector<uint8_t>& newData);
+
+static uv_loop_t *loop;
+// TODO make this client-associated
+std::unordered_map<std::string, std::vector<uint8_t>> tcpStore_;
+// From key -> the list of UvClient waiting on the key
+std::unordered_map<std::string, std::vector<UvClient *>> waitingSockets_;
+// From socket -> number of keys awaited
+std::unordered_map<UvClient *, size_t> keysAwaited_;
+//   // From key -> the list of sockets watching the key
+  std::unordered_map<std::string, std::vector<UvClient *>> watchedSockets_;
 
 
 class StreamWriter {
@@ -61,27 +83,24 @@ public:
         data.insert(data.end(), val.begin(), val.end());
     }
 
+    void write_string(const std::string &val) {
+        uint64_t size = val.size();
+        uint8_t *size_ptr = (uint8_t*)&size;
+        data.insert(data.end(), size_ptr, size_ptr + 8);
+        data.insert(data.end(), val.data(), val.data() + val.size());
+    }
+
     void send(uv_stream_t *client){
         buf = uv_buf_init((char*)data.data(), data.size());
         uv_write(&req, client, &buf, 1, write_done);
     }
+
     static StreamWriter* from_write_request(uv_write_t *req) {
         size_t offset = offsetof(StreamWriter, req);
         return reinterpret_cast<StreamWriter*>(reinterpret_cast<char*>(req) - offset);
-
     }
 };
 
-
-void write_done(uv_write_t *req, int status) {
-    printf("write done for %p\n", req);
-    if (status) {
-        printf("Write error %s\n", uv_strerror(status));
-    }
-
-    StreamWriter *sw = StreamWriter::from_write_request(req);
-    delete sw;
-}
 class ChunkedStream {
     std::deque<uv_buf_t> buffers;
     int buff_idx;
@@ -90,9 +109,7 @@ class ChunkedStream {
     int buff_offset_commit;
 
 public:
-    ChunkedStream(): buff_idx(0), buff_offset(0), buff_offset_commit(0) {
-
-    }
+    ChunkedStream(): buff_idx(0), buff_offset(0), buff_offset_commit(0) { }
 
     void append(uv_buf_t buf) {
         if(buf.len == 0) {
@@ -163,15 +180,15 @@ public:
     }
 
     void commit () {
-        printf("commiting %d [%d] bs:%zu bisz:%zu\n", buff_idx, buff_offset, buffers.size(), buffers[buff_idx].len);
+        // printf("commiting %d [%d] bs:%zu bisz:%zu\n", buff_idx, buff_offset, buffers.size(), buffers[buff_idx].len);
         if(buff_idx >= buffers.size() || buff_offset >= buffers[buff_idx].len) {
-            printf("\treset offset, full use\n");
+            // printf("\treset offset, full use\n");
             buff_offset = 0;
             ++buff_idx;
         }
 
         for(int i = 0; i < buff_idx; ++i) {
-            printf("deleting [%d] %p\n", i, buffers[0].base);
+            // printf("deleting [%d] %p\n", i, buffers[0].base);
             free(buffers[0].base);
             buffers.pop_front();
         }
@@ -182,23 +199,199 @@ public:
     void reset() {
         buff_idx = 0;
         buff_offset = buff_offset_commit;
-        printf("reset to offset %d\n", buff_offset);
+        // printf("reset to offset %d\n", buff_offset);
     }
 };
 
+class UvClient {
+    uv_tcp_t client;
+    ChunkedStream stream;
 
-static uv_loop_t *loop;
-// TODO make this client-associated
-class ChunkedStream the_stream;
-std::unordered_map<std::string, std::vector<uint8_t>> tcpStore_;
+public:
+
+    UvClient(uv_loop_t *loop) {
+            uv_tcp_init(loop, &client);
+    }
+
+    uv_stream_t* as_stream() {
+        return (uv_stream_t*)&client;
+    }
+
+    static UvClient* from_handle(uv_handle_t *handle) {
+        size_t offset = offsetof(UvClient, client);
+        return reinterpret_cast<UvClient*>(reinterpret_cast<char*>(handle) - offset);
+    }
+
+    void process_buf(const uv_buf_t *buf, size_t nread) {
+        auto tmp = *buf;
+        tmp.len = nread;
+        stream.append(tmp);
+        while(true) {
+            stream.reset();
+            uint8_t command = -1;
+            if(!stream.read1(command))
+                break;
+            switch ((QueryType)command) {
+            case QueryType::SET:
+                if(!parse_set_command())
+                    return;
+                break;
+            case QueryType::GET:
+                if(!parse_get_command())
+                    return;
+                break;
+            case QueryType::ADD:
+                if(!parse_add_command())
+                    return;
+                break;
+            case QueryType::WAIT:
+                if(!parse_wait_command())
+                    return;
+                break;
+                    
+            default:
+                printf("invalid command %d\n", command);
+                uv_close((uv_handle_t*) &client, on_close);
+                return;
+            }
+        }
+    }
+
+    bool parse_set_command() {
+        //1 byte command SET (done by the outer loop)
+        //key: 1 string
+        //data: 1 vector
+
+        std::string key;
+        if(!stream.read_str(key))
+            return false;
+
+        std::vector<uint8_t> newData;
+        if(!stream.read_vector(newData))
+            return false;
+
+        stream.commit();
+        printf("adding key %s with %zu bytes\n", key.c_str(), newData.size());
+
+        std::vector<uint8_t> oldData;
+        bool newKey = true;
+        auto it = tcpStore_.find(key);
+        if (it != tcpStore_.end()) {
+            oldData = it->second;
+            newKey = false;
+        }
+        tcpStore_[key] = newData;
+
+        // On "set", wake up all clients that have been waiting
+        wakeupWaitingClients(key);
+        // Send key update to all watching clients
+        newKey ? sendKeyUpdatesToClients(
+                    key, WatchResponseType::KEY_CREATED, oldData, newData)
+                : sendKeyUpdatesToClients(
+                    key, WatchResponseType::KEY_UPDATED, oldData, newData);
+
+        return true;
+    }
+
+    bool parse_wait_command() {
+        //1 byte command SET (done by the outer loop)
+        //key_count : int64_t
+        //key_count x strings
+        uint64_t key_count = 0;
+        if(!stream.read_value(key_count))
+            return false;
+
+        std::vector<std::string> keys(key_count);
+        for(auto i = 0; i < key_count; ++i) {
+            if(!stream.read_str(keys[i]))
+                return false;
+        }
+
+        stream.commit();
+
+        printf("WAIT %zu keys\n", key_count);
+        for(auto i = 0; i < key_count; ++i) {
+            printf("\t[%d] %s\n", i, keys[i].c_str());
+        }
+
+        if (checkKeys(keys)) {
+            StreamWriter* sw = new StreamWriter();
+            sw->write1((uint8_t)WaitResponseType::STOP_WAITING);
+            sw->send(as_stream());
+        } else {
+            printf("TODO implement wait\n");
+            int numKeysToAwait = 0;
+            for (auto& key : keys) {
+                // Only count keys that have not already been set
+                if (tcpStore_.find(key) == tcpStore_.end()) {
+                    waitingSockets_[key].push_back(this);
+                    numKeysToAwait++;
+                }
+            }
+            keysAwaited_[this] = numKeysToAwait;
+        }
+
+        return true;
+    }
+
+    bool parse_get_command() {
+        //1 byte command SET (done by the outer loop)
+        //key: 1 string
+
+
+        std::string key;
+        if(!stream.read_str(key))
+            return false;
+        stream.commit();
+
+        auto data = tcpStore_.at(key);
+        StreamWriter* sw = new StreamWriter();
+        sw->write_vector(data);
+        sw->send(as_stream());
+
+        return true;
+    }
+
+    bool parse_add_command() {
+        //1 byte command SET (done by the outer loop)
+        //key: 1 string
+
+
+        std::string key;
+        if(!stream.read_str(key))
+            return false;
+        stream.commit();
+
+        auto data = tcpStore_.at(key);
+        StreamWriter* sw = new StreamWriter();
+        sw->write_vector(data);
+        sw->send(as_stream());
+
+        return true;
+    }
+
+
+};
+
+
+void write_done(uv_write_t *req, int status) {
+    printf("write done for %p\n", req);
+    if (status) {
+        printf("Write error %s\n", uv_strerror(status));
+    }
+
+    StreamWriter *sw = StreamWriter::from_write_request(req);
+    delete sw;
+}
 
 void on_close(uv_handle_t* handle) {
-    free(handle);
+    UvClient *client = UvClient::from_handle(handle);
+    delete client;
 }
 
 
 void alloc_buffer(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf) {
-    printf("allocating %p for %zu\n", handle, suggested_size);
+    // printf("allocating %p for %zu\n", handle, suggested_size);
     buf->base = (char*) malloc(suggested_size);
     buf->len = suggested_size;
 }
@@ -210,154 +403,78 @@ bool checkKeys(const std::vector<std::string>& keys) {
 }
 
 
-
-bool parse_set_command() {
-    //1 byte command SET (done by the outer loop)
-    //key: 1 string
-    //data: 1 vector
-
-    std::string key;
-    if(!the_stream.read_str(key))
-        return false;
-
-    std::vector<uint8_t> data;
-    if(!the_stream.read_vector(data))
-        return false;
-
-    the_stream.commit();
-    printf("adding key %s with %zu bytes\n", key.c_str(), data.size());
-    tcpStore_[key] = data;
-
-    // On "set", wake up all clients that have been waiting
-    //   wakeupWaitingClients(key);
-    //   // Send key update to all watching clients
-    //   newKey ? sendKeyUpdatesToClients(
-    //                key, WatchResponseType::KEY_CREATED, oldData, newData)
-    //          : sendKeyUpdatesToClients(
-    //                key, WatchResponseType::KEY_UPDATED, oldData, newData);
-
-    return true;
-}
-
-
-bool parse_wait_command(uv_stream_t *client) {
-    //1 byte command SET (done by the outer loop)
-    //key_count : int64_t
-    //key_count x strings
-    uint64_t key_count = 0;
-    if(!the_stream.read_value(key_count))
-        return false;
-
-    std::vector<std::string> keys(key_count);
-    for(auto i = 0; i < key_count; ++i) {
-        if(!the_stream.read_str(keys[i]))
-            return false;
+void wakeupWaitingClients(const std::string& key) {
+  auto socketsToWait = waitingSockets_.find(key);
+  if (socketsToWait != waitingSockets_.end()) {
+    for (UvClient *client : socketsToWait->second) {
+      if (--keysAwaited_[client] == 0) {
+        printf("waking up client due to key %s\n", key.c_str());
+        StreamWriter* sw = new StreamWriter();
+        sw->write1((uint8_t)WaitResponseType::STOP_WAITING);
+        sw->send(client->as_stream());
+      }
     }
-
-    the_stream.commit();
-
-    printf("WAIT %zu keys\n", key_count);
-    for(auto i = 0; i < key_count; ++i) {
-        printf("\t[%d] %s\n", i, keys[i].c_str());
-    }
-
-  if (checkKeys(keys)) {
-    StreamWriter* sw = new StreamWriter();
-    sw->write1((uint8_t)WaitResponseType::STOP_WAITING);
-    sw->send(client);
-  } else {
-    printf("TODO implement wait\n");
+    waitingSockets_.erase(socketsToWait);
   }
-//     int numKeysToAwait = 0;
-//     for (auto& key : keys) {
-//       // Only count keys that have not already been set
-//       if (tcpStore_.find(key) == tcpStore_.end()) {
-//         waitingSockets_[key].push_back(socket);
-//         numKeysToAwait++;
-//       }
-//     }
-//     keysAwaited_[socket] = numKeysToAwait;
-//   }
-
-    return true;
 }
 
-bool parse_get_command(uv_stream_t *client) {
-    //1 byte command SET (done by the outer loop)
-    //key: 1 string
 
-    std::string key;
-    if(!the_stream.read_str(key))
-        return false;
-    the_stream.commit();
+void sendKeyUpdatesToClients(
+    const std::string& key,
+    WatchResponseType type,
+    std::vector<uint8_t>& oldData,
+    std::vector<uint8_t>& newData) {
+  for (UvClient *client : watchedSockets_[key]) {
+        StreamWriter* sw = new StreamWriter();
+        sw->write1((uint8_t)type);
+        sw->write_string(key);
+        sw->write_vector(oldData);
+        sw->write_vector(newData);
 
-    auto data = tcpStore_.at(key);
-    StreamWriter* sw = new StreamWriter();
-    sw->write_vector(data);
-    sw->send(client);
 
-    return true;
+        sw->send(client->as_stream());
+
+    // tcputil::sendValue<WatchResponseType>(socket, type);
+    // tcputil::sendString(socket, key, true);
+    // tcputil::sendVector<uint8_t>(socket, oldData);
+    // tcputil::sendVector<uint8_t>(socket, newData);
+  }
 }
+
 
 void read_callback(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf) {
-    printf("read cb %zu\n", nread);
+    // printf("read cb %zu\n", nread);
     if (nread < 0) {
         if (nread != UV_EOF)
             printf("Read error %s\n", uv_err_name(nread));
-        else
-            printf("disconnect?\n");
+        // else
+        //     printf("disconnect?\n");
         uv_close((uv_handle_t*) client, on_close);
         return;
     }
-    auto tmp = *buf;
-    tmp.len = nread;
-    the_stream.append(tmp);
-    while(true) {
-        the_stream.reset();
-        uint8_t command = -1;
-        if(!the_stream.read1(command))
-            break;
-        switch ((QueryType)command) {
-        case QueryType::SET:
-            if(!parse_set_command())
-                return;
-            break;
-        case QueryType::GET:
-            if(!parse_get_command(client))
-                return;
-            break;
-        case QueryType::WAIT:
-            if(!parse_wait_command(client))
-                return;
-            break;
-                
-        default:
-            printf("invalid command %d\n", command);
-            uv_close((uv_handle_t*) client, on_close);
-            return;
-        }
-    }
+    UvClient *uv_client = UvClient::from_handle((uv_handle_t*)client);
+    uv_client->process_buf(buf, nread);
 }
 
 
 void on_new_connection(uv_stream_t *server, int status){
-    printf("on_new_connection status %d\n", status);
+    // printf("on_new_connection status %d\n", status);
     if (status < 0){ 
         printf("Accept error: %s\n", uv_strerror(status));
         return;
     }
 
-    uv_tcp_t *client = (uv_tcp_t *)malloc(sizeof(uv_tcp_t));
-    uv_tcp_init(loop, client);
-    if (uv_accept(server, (uv_stream_t*) client) == 0) {
-        printf("accept all good, starting to read\n");
-        uv_read_start((uv_stream_t*) client, alloc_buffer, read_callback);
+    UvClient *client = new UvClient(loop);
+    if (uv_accept(server, client->as_stream()) == 0) {
+        // printf("accept all good, starting to read\n");
+        uv_read_start((uv_stream_t*) client->as_stream(), alloc_buffer, read_callback);
     } else {
         printf("failed to accept socket\n");
-        uv_close((uv_handle_t*) client, on_close);
+        uv_close((uv_handle_t*) client->as_stream(), on_close);
 
     }
 }
+
 
 int main() {
     struct sockaddr_in addr;

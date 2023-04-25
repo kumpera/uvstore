@@ -259,7 +259,14 @@ public:
                 if(!parse_wait_command())
                     return;
                 break;
-                    
+            case QueryType::GETNUMKEYS:
+                if(!parse_getnumkeys_command())
+                    return;
+                break;
+//   GETNUMKEYS,
+//   WATCH_KEY,
+//   DELETE_KEY,
+
             default:
                 printf("invalid command %d\n", command);
                 uv_close((uv_handle_t*) &client, on_close);
@@ -497,7 +504,40 @@ public:
         return true;
     }
 
+    bool parse_getnumkeys_command() {
+        stream.commit();
 
+        StreamWriter* sw = new StreamWriter();
+        sw->write_value<int64_t>(tcpStore_.size());
+        sw->send(as_stream());
+
+        return true;
+    }
+
+// void TCPStoreMasterDaemon::deleteHandler(int socket) {
+//   std::string key = tcputil::recvString(socket);
+//   auto it = tcpStore_.find(key);
+//   if (it != tcpStore_.end()) {
+//     std::vector<uint8_t> oldData = it->second;
+//     // Send key update to all watching clients
+//     std::vector<uint8_t> newData;
+//     sendKeyUpdatesToClients(
+//         key, WatchResponseType::KEY_DELETED, oldData, newData);
+//   }
+//   auto numDeleted = tcpStore_.erase(key);
+//   tcputil::sendValue<int64_t>(socket, numDeleted);
+// }
+
+// void TCPStoreMasterDaemon::watchHandler(int socket) {
+//   std::string key = tcputil::recvString(socket);
+
+//   // Record the socket to respond to when the key is updated
+//   watchedSockets_[key].push_back(socket);
+
+//   // Send update to TCPStoreWorkerDaemon on client
+//   tcputil::sendValue<WatchResponseType>(
+//       socket, WatchResponseType::KEY_CALLBACK_REGISTERED);
+// }
 };
 
 

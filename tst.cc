@@ -115,11 +115,13 @@ class ChunkedStream {
     std::deque<uv_buf_t> buffers;
     int buff_idx;
     int buff_offset;
+    int capacity;
     int buff_idx_commit;
     int buff_offset_commit;
+    int read_offset;
 
 public:
-    ChunkedStream(): buff_idx(0), buff_offset(0), buff_idx_commit(0), buff_offset_commit(0) { }
+    ChunkedStream(): buff_idx(0), buff_offset(0), capacity(0), buff_idx_commit(0), buff_offset_commit(0), read_offset(0) { }
 
     size_t buf_count() { return buffers.size(); }
 
@@ -127,6 +129,7 @@ public:
         if(buf.len == 0) {
             free(buf.base);
         } else {
+            capacity += buf.len;
             buffers.push_back(buf);
         }
     }
@@ -145,6 +148,7 @@ public:
 
         byte = buffers[buff_idx].base[buff_offset];
         ++buff_offset;
+        ++read_offset;
         return true;
     }
 
@@ -163,15 +167,16 @@ public:
         uint64_t size = 0;
         if(!read_value(size))
             return false;
-        //TODO add and use a isAvailable(size_t sz) that test if at least sz is available
-        //TODO avoid allocating this temp vector
-        std::vector<char> value(size);
+        if(available() < size)
+            return false;
+        str.reserve(size);
         //TODO optimize this with larger chunks copies
         for(int i = 0; i < size; ++i) {
-            if(!read_value(value[i]))
+            char c;
+            if(!read_value(c))
                 return false;
+            str.push_back(c);
         }
-        str = std::string(value.data(), value.size());
         return true;
     }
 
@@ -180,8 +185,10 @@ public:
         uint64_t size = 0;
         if(!read_value(size))
             return false;
-        //TODO add and use a isAvailable(size_t sz) that test if at least sz is available
+        if(available() < size)
+            return false;
         data.reserve(size);
+        //TODO optimize this with larger chunks copies
         for(int i = 0; i < size; ++i) {
             T tmp = {};
             if(!read_value(tmp))
@@ -189,6 +196,10 @@ public:
             data.push_back(tmp);
         }
         return true;
+    }
+
+    int available() {
+        return capacity - read_offset;
     }
 
     void commit () {
@@ -199,15 +210,17 @@ public:
 
         for(int i = 0; i < buff_idx; ++i) {
             free(buffers[0].base);
+            capacity -= buffers[0].len;
             buffers.pop_front();
         }
         buff_idx = 0;
-        buff_offset_commit = buff_offset;
+        read_offset = buff_offset_commit = buff_offset;
     }
 
     void reset() {
         buff_idx = 0;
-        buff_offset = buff_offset_commit;
+        read_offset = buff_offset = buff_offset_commit;
+
     }
 };
 

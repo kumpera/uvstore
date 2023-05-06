@@ -282,6 +282,7 @@ public:
                 uv_close((uv_handle_t*) &client, on_close);
                 return;
             }
+            stream.commit();
 
         }
     }
@@ -297,8 +298,6 @@ public:
         std::vector<uint8_t> newData;
         if(!stream.read_vector(newData))
             return false;
-
-        stream.commit();
 
         std::vector<uint8_t> oldData;
         bool newKey = true;
@@ -338,8 +337,6 @@ public:
                 return false;
         }
 
-        stream.commit();
-
         if (checkKeys(keys)) {
             StreamWriter* sw = new StreamWriter();
             sw->write1((uint8_t)WaitResponseType::STOP_WAITING);
@@ -365,7 +362,6 @@ public:
         std::string key;
         if(!stream.read_str(key))
             return false;
-        stream.commit();
 
         auto data = tcpStore_.at(key);
         StreamWriter* sw = new StreamWriter();
@@ -386,8 +382,6 @@ public:
         int64_t addVal = 0;
         if(!stream.read_value(addVal))
             return false;
-
-        stream.commit();
 
         bool newKey = true;
         std::vector<uint8_t> oldData;
@@ -434,7 +428,6 @@ public:
         std::vector<uint8_t> newValue;
         if(!stream.read_vector(newValue))
             return false;
-        stream.commit();
 
         auto pos = tcpStore_.find(key);
         if (pos == tcpStore_.end()) {
@@ -484,7 +477,6 @@ public:
             if(!stream.read_str(keys[i]))
                 return false;
         }
-        stream.commit();
 
         // Now we have received all the keys
         StreamWriter* sw = new StreamWriter();
@@ -498,8 +490,6 @@ public:
     }
 
     bool parse_getnumkeys_command() {
-        stream.commit();
-
         StreamWriter* sw = new StreamWriter();
         sw->write_value<int64_t>(tcpStore_.size());
         sw->send(as_stream());
@@ -513,7 +503,6 @@ public:
         std::string key;
         if(!stream.read_str(key))
             return false;
-        stream.commit();
 
         auto it = tcpStore_.find(key);
         if (it != tcpStore_.end()) {
@@ -538,7 +527,6 @@ public:
         std::string key;
         if(!stream.read_str(key))
             return false;
-        stream.commit();
 
         // Record the socket to respond to when the key is updated
         watchedSockets_[key].push_back(this);

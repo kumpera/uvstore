@@ -7,11 +7,11 @@ class UvServer;
 class UvClient;
 }
 
-class UvStore : c10d::Store {
+class UvStore : public c10d::Store {
   std::shared_ptr<detail::UvServer> server_;
   std::unique_ptr<detail::UvClient> client_;
 
-    void waitForWorkers();
+  void waitForWorkers();
 public:
   explicit UvStore(std::string host, const c10d::TCPStoreOptions& opts = {});
 
@@ -40,9 +40,6 @@ public:
       const std::vector<std::string>& keys,
       const std::chrono::milliseconds& timeout) override;
 
-  const std::chrono::milliseconds& getTimeout() const noexcept override;
-
-  void setTimeout(const std::chrono::milliseconds& timeout) override;
 
   void watchKey(const std::string& key, c10d::WatchKeyCallback callback) override;
 

@@ -181,17 +181,6 @@ public:
     template <typename T>
     bool read_value(T& value) {
         return read_many((char*)&value, sizeof(T));
-
-        uint8_t *val = (uint8_t*)&value;
-        if(available() < sizeof(T))
-            return false;
-
-        //TODO optimize this to read larger chunks from the current buf
-        for(int i = 0; i < sizeof(T); ++i) {
-            if(!read1(val[i]))
-                return false;
-        }
-        return true;
     }
 
     bool read_str(std::string &str) {
@@ -202,15 +191,6 @@ public:
             return false;
         str.resize(size);
         return read_many((char*)str.data(), size);
-
-        //TODO optimize this with larger chunks copies
-        for(int i = 0; i < size; ++i) {
-            char c;
-            if(!read_value(c))
-                return false;
-            str.push_back(c);
-        }
-        return true;
     }
 
     template <typename T>
@@ -223,16 +203,6 @@ public:
             return false;
         data.resize(size);
         return read_many((char*)data.data(), size_in_bytes);
-
-        data.reserve(size);
-        //TODO optimize this with larger chunks copies
-        for(int i = 0; i < size; ++i) {
-            T tmp = {};
-            if(!read_value(tmp))
-                return false;
-            data.push_back(tmp);
-        }
-        return true;
     }
 
     int available() {

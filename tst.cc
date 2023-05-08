@@ -136,7 +136,6 @@ public:
         }
     }
     bool read_many(char *dest, size_t size) {
-        // printf("read_many %p < %p %ld bsize: %zu\n", this, dest, size, buffers.size());
         if(available() < size){
             return false;
         }
@@ -145,7 +144,6 @@ public:
         char* write_base = dest;
         while(remaining > 0) {
             auto to_read = std::min(buffers[buff_idx].len - buff_offset, remaining);
-            // printf("[%p] copying %p < %p (%zu) bsize:%zu\n", this, write_base, buffers[buff_idx].base + buff_offset, to_read, buffers.size());
             ::memcpy(write_base, buffers[buff_idx].base + buff_offset, to_read);
             buff_offset += to_read;
             remaining -= to_read;
@@ -159,12 +157,10 @@ public:
                 }
             }
         }
-        // printf("read_many done size %zu\n", buffers.size());
         return true;
     }
 
     bool read1(uint8_t &byte) {
-        // printf("%p bidx: %d boff %d bsize:%zu\n", this, buff_idx, buff_offset, buffers.size());
         while(true) {
             if(buff_idx >= buffers.size())
                 return false;
@@ -184,7 +180,6 @@ public:
 
     template <typename T>
     bool read_value(T& value) {
-        // printf("read value:\n");
         return read_many((char*)&value, sizeof(T));
 
         uint8_t *val = (uint8_t*)&value;
@@ -296,7 +291,6 @@ public:
             uint8_t command = -1;
             if(!stream.read1(command))
                 break;
-            // printf("CMD IS %p -> %d\n", this, command);
             switch ((QueryType)command) {
             case QueryType::SET:
                 if(!parse_set_command())
@@ -339,10 +333,7 @@ public:
                 uv_close((uv_handle_t*) &client, on_close);
                 return;
             }
-            // printf("[%p] cmd done, bsize %zu\n", this, stream.buf_count());
             stream.commit();
-            // printf("[%p] commit done, bsize %zu\n", this, stream.buf_count());
-
         }
     }
 
@@ -442,7 +433,6 @@ public:
         if(!stream.read_value(addVal))
             return false;
 
-        // printf("ADD %p k:%s v:%ld\n", this, key.c_str(), addVal);
         bool newKey = true;
         std::vector<uint8_t> oldData;
         auto it = tcpStore_.find(key);
@@ -607,7 +597,6 @@ void write_done(uv_write_t *req, int status) {
         //TODO close the stream?
     }
 
-    // printf("freeing write request %p\n", req);
     StreamWriter *sw = StreamWriter::from_write_request(req);
     delete sw;
 }

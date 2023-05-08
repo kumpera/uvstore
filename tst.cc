@@ -3,6 +3,7 @@
 #include <uv.h>
 #include <stdexcept>
 #include <string>
+#include <cstring>
 #include <vector>
 #include <deque>
 #include <unordered_map>
@@ -120,6 +121,7 @@ class ChunkedStream {
     int buff_offset_commit;
     int read_offset;
 
+
 public:
     ChunkedStream(): buff_idx(0), buff_offset(0), capacity(0), buff_idx_commit(0), buff_offset_commit(0), read_offset(0) { }
 
@@ -133,8 +135,36 @@ public:
             buffers.push_back(buf);
         }
     }
+    bool read_many(char *dest, size_t size) {
+        // printf("read_many %p < %p %ld bsize: %zu\n", this, dest, size, buffers.size());
+        if(available() < size){
+            return false;
+        }
+
+        size_t remaining = size;
+        char* write_base = dest;
+        while(remaining > 0) {
+            auto to_read = std::min(buffers[buff_idx].len - buff_offset, remaining);
+            // printf("[%p] copying %p < %p (%zu) bsize:%zu\n", this, write_base, buffers[buff_idx].base + buff_offset, to_read, buffers.size());
+            ::memcpy(write_base, buffers[buff_idx].base + buff_offset, to_read);
+            buff_offset += to_read;
+            remaining -= to_read;
+            write_base += to_read;
+            if(buff_offset >= buffers[buff_idx].len) {
+                buff_offset = 0;
+                ++buff_idx;
+                if (buff_idx >= buffers.size() && remaining > 0) {
+                    printf("BAD STATE idx:%d size:%zu size:%zu remaining:%zu\n", buff_idx, buffers.size(), size, remaining);
+                    exit(-2);
+                }
+            }
+        }
+        // printf("read_many done size %zu\n", buffers.size());
+        return true;
+    }
 
     bool read1(uint8_t &byte) {
+        // printf("%p bidx: %d boff %d bsize:%zu\n", this, buff_idx, buff_offset, buffers.size());
         while(true) {
             if(buff_idx >= buffers.size())
                 return false;
@@ -154,6 +184,9 @@ public:
 
     template <typename T>
     bool read_value(T& value) {
+        // printf("read value:\n");
+        return read_many((char*)&value, sizeof(T));
+
         uint8_t *val = (uint8_t*)&value;
         if(available() < sizeof(T))
             return false;
@@ -172,7 +205,9 @@ public:
             return false;
         if(available() < size)
             return false;
-        str.reserve(size);
+        str.resize(size);
+        return read_many((char*)str.data(), size);
+
         //TODO optimize this with larger chunks copies
         for(int i = 0; i < size; ++i) {
             char c;
@@ -188,8 +223,12 @@ public:
         uint64_t size = 0;
         if(!read_value(size))
             return false;
-        if(available() < size)
+        auto size_in_bytes = size * sizeof(T);
+        if(available() < size_in_bytes)
             return false;
+        data.resize(size);
+        return read_many((char*)data.data(), size_in_bytes);
+
         data.reserve(size);
         //TODO optimize this with larger chunks copies
         for(int i = 0; i < size; ++i) {
@@ -208,7 +247,8 @@ public:
     void commit () {
         if(buff_idx >= buffers.size() || buff_offset >= buffers[buff_idx].len) {
             buff_offset = 0;
-            ++buff_idx;
+            if (buff_idx < buffers.size())
+                ++buff_idx;
         }
 
         for(int i = 0; i < buff_idx; ++i) {
@@ -256,6 +296,7 @@ public:
             uint8_t command = -1;
             if(!stream.read1(command))
                 break;
+            // printf("CMD IS %p -> %d\n", this, command);
             switch ((QueryType)command) {
             case QueryType::SET:
                 if(!parse_set_command())
@@ -298,7 +339,9 @@ public:
                 uv_close((uv_handle_t*) &client, on_close);
                 return;
             }
+            // printf("[%p] cmd done, bsize %zu\n", this, stream.buf_count());
             stream.commit();
+            // printf("[%p] commit done, bsize %zu\n", this, stream.buf_count());
 
         }
     }
@@ -399,6 +442,7 @@ public:
         if(!stream.read_value(addVal))
             return false;
 
+        // printf("ADD %p k:%s v:%ld\n", this, key.c_str(), addVal);
         bool newKey = true;
         std::vector<uint8_t> oldData;
         auto it = tcpStore_.find(key);

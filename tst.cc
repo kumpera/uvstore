@@ -155,6 +155,9 @@ public:
     template <typename T>
     bool read_value(T& value) {
         uint8_t *val = (uint8_t*)&value;
+        if(available() < sizeof(T))
+            return false;
+
         //TODO optimize this to read larger chunks from the current buf
         for(int i = 0; i < sizeof(T); ++i) {
             if(!read1(val[i]))
